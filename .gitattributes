@@ -1,0 +1,5 @@
+* text=auto
+*.sln text eol=crlf
+*.sty binary
+*.STY binary
+*.mid binary
