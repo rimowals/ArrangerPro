@@ -129,6 +129,20 @@ TEST_CASE("intro, then main; ending stops")
     CHECK_EQ(r.balance(), 0);
 }
 
+TEST_CASE("intro can be started again while playing")
+{
+    Recorder r;
+    r.engine.setStyle(testStyle());
+    r.engine.armIntro(SectionId::IntroA);
+    r.engine.start();
+    r.engine.advanceTo(2 * kBar + kBeat);     // intro done, Main A playing in bar 2
+    r.engine.selectIntro(SectionId::IntroA);
+    CHECK(r.engine.nextSection() == SectionId::IntroA);
+    r.engine.advanceTo(4 * kBar + 1);
+    // intro again from bar 3, then back to Main A in bar 4
+    CHECK(r.noteOns() == On({{0, 48}, {kBar, 60}, {2 * kBar, 60}, {3 * kBar, 48}, {4 * kBar, 60}}));
+}
+
 TEST_CASE("sync start begins with the first chord")
 {
     Recorder r;
@@ -140,6 +154,46 @@ TEST_CASE("sync start begins with the first chord")
     CHECK(r.engine.isPlaying());
     r.engine.advanceTo(600);
     CHECK(r.noteOns() == On({{500, 55}}));
+}
+
+TEST_CASE("mixer volume overrides the style's CC7")
+{
+    auto style = testStyle();
+    style->setup[int(PartRole::Chord1)].push_back({0, 0xB0, 7, 90});
+    Recorder r;
+    r.engine.setStyle(style);
+    r.engine.setPartVolume(PartRole::Chord1, 50);
+    r.events.clear();
+    r.engine.start();
+    int last = -1;
+    for (const auto& e : r.events)
+        if (e.data[0] == (0xB0 | 11) && e.data[1] == 7)
+            last = e.data[2];
+    CHECK_EQ(last, 50);
+}
+
+TEST_CASE("program changes are sent only when enabled")
+{
+    auto style = testStyle();
+    style->setup[int(PartRole::Bass)] = {{0, 0xB0, 0, 0}, {0, 0xC0, 33, 0}};
+    auto programChanges = [](const Recorder& r) {
+        int n = 0;
+        for (const auto& e : r.events)
+            if (e.data[0] == (0xC0 | 10) && e.data[1] == 33 && e.size == 2)
+                ++n;
+        return n;
+    };
+
+    Recorder off;
+    off.engine.setStyle(style);
+    off.engine.sendSetupNow();
+    CHECK_EQ(programChanges(off), 0);
+
+    Recorder on;
+    on.engine.settings().sendProgramChanges = true;
+    on.engine.setStyle(style);
+    on.engine.sendSetupNow();
+    CHECK_EQ(programChanges(on), 1);
 }
 
 TEST_CASE("muted part is silent and released")

@@ -518,12 +518,80 @@ std::optional<ChordVariation> buildVariation(const KStyle& style, int elementInd
     return variation;
 }
 
+// StylePerformances (STS) object. Not documented publicly; layout found on Pa50 banks:
+// every track's sound record contains the marker 7F 15 6C followed by
+//   +3 bank MSB (GM2: 120 kits / 121 melodic), +4 bank LSB, +6 program, +7 volume, +8 pan,
+//   +10 transpose (signed semitones)
+// and is preceded by three header bytes. The object holds 8 accompaniment records, then one
+// block of 4 keyboard records (Upper 1, Upper 2, Upper 3, Lower) per STS. In the header,
+// bit 2 of the second byte marks a playing track (Upper 1 has it in every STS of every
+// Pa50 style examined; to be confirmed on the keyboard).
+std::vector<OneTouchSetting> readSts(const std::vector<uint8_t>& sts)
+{
+    std::vector<size_t> records;
+    for (size_t i = 3; i + 11 <= sts.size(); ++i)
+        if (sts[i] == 0x7F && sts[i + 1] == 0x15 && sts[i + 2] == 0x6C && (sts[i + 3] == 120 || sts[i + 3] == 121))
+            records.push_back(i);
+
+    constexpr size_t kAccompanimentRecords = 8;
+    if (records.size() < kAccompanimentRecords + 4)
+        return {};
+
+    static constexpr KeyboardPart kOrder[4] = {KeyboardPart::Right1, KeyboardPart::Right2, KeyboardPart::Right3, KeyboardPart::Left};
+    std::vector<OneTouchSetting> result;
+    for (size_t first = kAccompanimentRecords; first + 4 <= records.size() && result.size() < 4; first += 4)
+    {
+        OneTouchSetting ots;
+        for (size_t p = 0; p < 4; ++p)
+        {
+            const size_t i = records[first + p];
+            PartVoice& v = ots.parts[size_t(kOrder[p])];
+            const bool drums = sts[i + 3] == 120;
+            v.on = (sts[i - 2] & 0x04) != 0;
+            v.hasVoice = true;
+            v.bankMsb = drums ? 127 : 0;
+            v.bankLsb = 0;
+            v.program = sts[i + 6] & 0x7F;
+            v.volume = sts[i + 7] & 0x7F;
+            v.pan = sts[i + 8] & 0x7F;
+            v.transpose = int(int8_t(sts[i + 10]));
+            if (v.transpose < -24 || v.transpose > 24)
+                v.transpose = 0;
+        }
+        result.push_back(ots);
+    }
+
+    // Pad assignments: "<sts> 02 01 00 00 00 DE 00 FE 04 02 00 02 01 00 02 00 00", then 4 records
+    // of 10 bytes: pad number, FF, volume, pan, ... (styles from older firmware have none).
+    for (size_t i = 6; i + 12 + 4 * 10 <= sts.size(); ++i)
+    {
+        if (sts[i] != 0xDE || sts[i + 1] != 0x00 || sts[i + 2] != 0xFE || sts[i + 3] != 0x04 || sts[i - 5] != 0x02)
+            continue;
+        const size_t index = sts[i - 6];
+        if (index >= result.size())
+            continue;
+        for (size_t p = 0; p < size_t(kStylePadCount); ++p)
+        {
+            const size_t r = i + 12 + p * 10;
+            if (sts[r + 1] != 0xFF)
+                continue;
+            PadRef& pad = result[index].pads[p];
+            pad.id = sts[r];
+            pad.volume = sts[r + 2] & 0x7F;
+            pad.pan = sts[r + 3] & 0x7F;
+        }
+    }
+    return result;
+}
+
 Style convert(const KStyle& k, const std::string& bankName)
 {
     Style style;
     style.name = k.name;
     style.sourcePath = bankName;
     style.format = StyleFormat::KorgPa;
+
+    style.ots = readSts(k.sts);
 
     // The StylePerformances tempo byte (offset found empirically on Pa50 banks).
     if (k.sts.size() > 0x19 && k.sts[0x19] >= 30 && k.sts[0x19] <= 250)
@@ -550,9 +618,13 @@ Style convert(const KStyle& k, const std::string& bankName)
     {
         const KTrackData& d = first->tracks[track];
         auto& setup = style.setup[int(kRoleOf[track])];
-        setup.push_back({0, 0xB0, 0, d.bankMsb});
-        setup.push_back({0, 0xB0, 32, d.bankLsb});
-        setup.push_back({0, 0xC0, d.program, 0});
+        // Pa styles address GM2 banks: MSB 120 = drum kits, MSB 121 = melodic (LSB = variation),
+        // programs are GM numbers. XG/GS modules want MSB 127 for kits and MSB 0 otherwise; the
+        // GM2 variation LSB means something else there, so the basic voice is selected.
+        const bool drums = d.bankMsb == 120;
+        setup.push_back({0, 0xB0, 0, uint8_t(drums ? 127 : 0)});
+        setup.push_back({0, 0xB0, 32, 0});
+        setup.push_back({0, 0xC0, uint8_t(d.program & 0x7F), 0});
         setup.push_back({0, 0xB0, 7, 100});
         setup.push_back({0, 0xB0, 11, d.expression > 0 && d.expression <= 127 ? d.expression : uint8_t(127)});
     }
@@ -677,7 +749,8 @@ std::vector<Style> readKorgStyleBank(std::span<const uint8_t> file, const std::s
             }
             raw.push_back(std::move(style));
         }
-        else if (chunk.type == 9 && toc[i].objectType == 7 && !raw.empty() && raw.back().tocName == toc[i].name)
+        // The StylePerformances object follows its style; its name may differ from the style's.
+        else if (chunk.type == 9 && toc[i].objectType == 7 && !raw.empty() && raw.back().sts.empty())
             raw.back().sts.assign(data.begin(), data.end());
     }
 

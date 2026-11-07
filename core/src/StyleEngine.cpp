@@ -111,6 +111,18 @@ void StyleEngine::armIntro(std::optional<SectionId> intro)
     intro_ = intro && isIntro(*intro) ? intro : std::nullopt;
 }
 
+void StyleEngine::selectIntro(SectionId intro)
+{
+    if (!style_ || !isIntro(intro) || !style_->has(intro))
+        return;
+    if (!playing_)
+    {
+        armIntro(intro);
+        return;
+    }
+    pending_ = Pending{barStart(now_) + style_->barLength(), intro};
+}
+
 void StyleEngine::selectEnding(SectionId ending)
 {
     if (!style_ || !playing_ || !isEnding(ending))
@@ -326,7 +338,6 @@ void StyleEngine::emitRange(int64_t from, int64_t to)
     for (const Item& item : items)
     {
         flushOffs(item.tick);
-        const uint8_t channel = uint8_t(settings_.outputChannel[int(item.part->role)]);
         if (item.note)
         {
             // Notes never ring past the end of the pattern cycle they belong to.
@@ -334,13 +345,7 @@ void StyleEngine::emitRange(int64_t from, int64_t to)
             startNote(item.tick, *item.part, *item.note, std::min<int64_t>(item.tick + item.note->length, cycleEnd));
         }
         else
-        {
-            const ChannelEvent& e = *item.control;
-            if (!settings_.sendProgramChanges && isProgramMessage(e.status, e.data1))
-                continue;
-            const uint8_t type = e.type();
-            send(item.tick, uint8_t(type | channel), e.data1, e.data2, (type == 0xC0 || type == 0xD0) ? 2 : 3);
-        }
+            sendPartEvent(item.tick, int(item.part->role), *item.control);
     }
     flushOffs(to);
 }
@@ -396,19 +401,40 @@ void StyleEngine::send(int64_t tick, uint8_t status, uint8_t d1, uint8_t d2, uin
         sink_(MidiOut{tick, {status, uint8_t(d1 & 0x7F), uint8_t(d2 & 0x7F)}, size});
 }
 
+void StyleEngine::sendPartEvent(int64_t tick, int role, const ChannelEvent& e)
+{
+    if (!settings_.sendProgramChanges && isProgramMessage(e.status, e.data1))
+        return;
+    const uint8_t type = e.type();
+    uint8_t value = e.data2;
+    if (type == 0xB0 && e.data1 == 7 && settings_.volume[role] >= 0)
+        value = uint8_t(settings_.volume[role]);
+    const uint8_t channel = uint8_t(settings_.outputChannel[role]);
+    send(tick, uint8_t(type | channel), e.data1, value, (type == 0xC0 || type == 0xD0) ? 2 : 3);
+}
+
 void StyleEngine::sendSetup(int64_t tick)
 {
     for (int role = 0; role < kPartCount; ++role)
     {
-        const uint8_t channel = uint8_t(settings_.outputChannel[role]);
         for (const auto& e : style_->setup[role])
-        {
-            if (!settings_.sendProgramChanges && isProgramMessage(e.status, e.data1))
-                continue;
-            const uint8_t type = e.type();
-            send(tick, uint8_t(type | channel), e.data1, e.data2, (type == 0xC0 || type == 0xD0) ? 2 : 3);
-        }
+            sendPartEvent(tick, role, e);
+        if (settings_.volume[role] >= 0)
+            send(tick, uint8_t(0xB0 | settings_.outputChannel[role]), 7, uint8_t(settings_.volume[role]));
     }
+}
+
+void StyleEngine::sendSetupNow()
+{
+    if (style_)
+        sendSetup(now_);
+}
+
+void StyleEngine::setPartVolume(PartRole role, int volume)
+{
+    settings_.volume[int(role)] = std::clamp(volume, -1, 127);
+    if (volume >= 0)
+        send(now_, uint8_t(0xB0 | settings_.outputChannel[int(role)]), 7, uint8_t(volume));
 }
 
 // ---------------------------------------------------------------- helpers

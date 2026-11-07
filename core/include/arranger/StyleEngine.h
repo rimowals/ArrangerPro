@@ -24,6 +24,7 @@ struct EngineSettings {
     std::array<int, kPartCount> outputChannel{8, 9, 10, 11, 12, 13, 14, 15}; // 0-based
     bool sendProgramChanges = false; // off by default: sounds are chosen in the VST host
     bool autoFill = true;            // a fill leads into a newly selected main section
+    std::array<int, kPartCount> volume{-1, -1, -1, -1, -1, -1, -1, -1}; // CC7 override, -1 = the style's
 };
 
 // Tick-driven style player. Not thread-safe: the host serialises calls (e.g. under a lock
@@ -35,6 +36,7 @@ public:
     void setStyle(std::shared_ptr<const Style> style);
     const Style* style() const { return style_.get(); }
     EngineSettings& settings() { return settings_; }
+    const EngineSettings& settings() const { return settings_; }
 
     // ---- transport ----
     void start();
@@ -46,6 +48,9 @@ public:
     // ---- sections ----
     void selectMain(SectionId main);         // while playing: fill (if enabled) then switch at the bar line
     void armIntro(std::optional<SectionId> intro); // used by the next start()
+    // Stopped: arms the intro for start(). Playing: the intro starts at the next bar line and
+    // leads back into the selected main.
+    void selectIntro(SectionId intro);
     void selectEnding(SectionId ending);     // while playing: ending from the next bar, then stop
     void triggerBreak();
 
@@ -54,6 +59,10 @@ public:
     const Chord& chord() const { return chord_; }
     void setPartMute(PartRole role, bool muted);
     bool partMuted(PartRole role) const { return muted_[int(role)]; }
+    void setPartVolume(PartRole role, int volume); // 0..127, -1 = back to the style's level
+    // Sends the style's channel setup (voices, volumes, effects) now, e.g. right after loading
+    // a style, so a GM/XG module has the right sounds before playback starts.
+    void sendSetupNow();
 
     // Emits every message due before `tick` (note-offs up to and including `tick`).
     void advanceTo(int64_t tick);
@@ -91,6 +100,7 @@ private:
     void releaseAll(int64_t tick);
     void releaseIf(int64_t tick, const std::function<bool(const ActiveNote&)>& predicate);
     void send(int64_t tick, uint8_t status, uint8_t d1, uint8_t d2, uint8_t size = 3);
+    void sendPartEvent(int64_t tick, int role, const ChannelEvent& e);
     void sendSetup(int64_t tick);
     void stopAt(int64_t tick);
 

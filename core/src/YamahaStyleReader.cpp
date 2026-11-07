@@ -1,11 +1,13 @@
 // Yamaha style files: a Standard MIDI File (format 0) whose track holds all sections back
 // to back, delimited by marker meta events ("SFF1"/"SFF2", "SInt", "Intro A", "Main A", ...),
-// followed by the CASM chunk with per-channel transposition rules (Ctab for SFF1, Ctb2 for SFF2).
+// followed by the CASM chunk with per-channel transposition rules (Ctab for SFF1, Ctb2 for SFF2)
+// and the OTSc chunk with the One Touch Settings.
 // Layout per "Style Files — Introduction and Details" (P. Wierzba, M. P. Bedesem).
 
 #include "arranger/StyleLoader.h"
 
 #include "ByteReader.h"
+#include "Smf.h"
 #include "StyleDefaults.h"
 
 #include <algorithm>
@@ -16,13 +18,8 @@ namespace arr {
 namespace {
 
 using detail::ByteReader;
-
-struct RawEvent {
-    int64_t tick;
-    uint8_t status;      // 0xFF = meta, 0xF0/0xF7 = sysex, otherwise channel status
-    uint8_t data1 = 0, data2 = 0;
-    std::string meta;    // meta payload
-};
+using detail::SmfEvent;
+using detail::isChannelControl;
 
 struct Marker {
     int64_t tick;
@@ -36,50 +33,6 @@ struct CtabEntry {
 };
 
 using Casm = std::map<SectionId, std::vector<CtabEntry>>;
-
-// ---------------------------------------------------------------- SMF
-
-void readTrack(ByteReader r, std::vector<RawEvent>& out)
-{
-    int64_t tick = 0;
-    uint8_t running = 0;
-
-    while (!r.atEnd())
-    {
-        tick += r.varLen();
-        uint8_t status = r.peek();
-        if (status & 0x80)
-            r.u8();
-        else if (running)
-            status = running;
-        else
-            throw StyleError("MIDI data without status byte");
-
-        if (status == 0xFF)
-        {
-            uint8_t type = r.u8();
-            uint32_t len = r.varLen();
-            RawEvent e{tick, 0xFF, type};
-            e.meta = r.ascii(len);
-            out.push_back(std::move(e)); // end-of-track is kept: it marks the end of the last section
-            if (type == 0x2F)
-                return;
-        }
-        else if (status == 0xF0 || status == 0xF7)
-        {
-            r.skip(r.varLen()); // sysex is not needed: setups are sent as channel messages
-        }
-        else
-        {
-            running = status;
-            RawEvent e{tick, status, r.u8()};
-            uint8_t type = status & 0xF0;
-            if (type != 0xC0 && type != 0xD0)
-                e.data2 = r.u8();
-            out.push_back(std::move(e));
-        }
-    }
-}
 
 // ---------------------------------------------------------------- CASM
 
@@ -152,7 +105,7 @@ std::optional<CtabEntry> readCtb2(std::span<const uint8_t> d)
     TransposeRange* ranges[3] = {&e.rule.low, &e.rule.mid, &e.rule.high};
     for (int i = 0; i < 3; ++i)
     {
-        auto b = d.subspan(22 + 6 * i, 6);
+        auto b = d.subspan(size_t(22 + 6 * i), 6);
         TransposeRange& r = *ranges[i];
         r.ntr = toNtr(b[0]);
         r.ntt = sff2Ntt(r.ntr, b[1] & 0x7F);
@@ -233,6 +186,61 @@ Casm readCasm(ByteReader r, std::vector<std::string>& warnings)
     return casm;
 }
 
+// ---------------------------------------------------------------- OTS
+
+// OTS tracks address the keyboard parts by channel: 1 = Right1, 2 = Right2, 3 = Right3, 4 = Left
+// (in real styles channel 4 keeps the same pad/strings voice across all four OTS).
+constexpr int kOtsPartOfChannel[4] = {int(KeyboardPart::Right1), int(KeyboardPart::Right2),
+                                      int(KeyboardPart::Right3), int(KeyboardPart::Left)};
+
+OneTouchSetting readOtsTrack(std::span<const uint8_t> track)
+{
+    std::vector<SmfEvent> events;
+    detail::readTrackEvents(track, events);
+
+    OneTouchSetting ots;
+    for (const auto& e : events)
+    {
+        const int channel = e.status & 0x0F;
+        if (!isChannelControl(e) || channel >= 4)
+            continue;
+        PartVoice& v = ots.parts[size_t(kOtsPartOfChannel[channel])];
+        v.on = true;
+        if ((e.status & 0xF0) == 0xC0)
+        {
+            v.program = e.data1;
+            v.hasVoice = true;
+        }
+        else if ((e.status & 0xF0) == 0xB0)
+            switch (e.data1)
+            {
+                case 0: v.bankMsb = e.data2; break;
+                case 32: v.bankLsb = e.data2; break;
+                case 7: v.volume = e.data2; break;
+                case 10: v.pan = e.data2; break;
+                case 91: v.reverb = e.data2; break;
+                case 93: v.chorus = e.data2; break;
+                default: break;
+            }
+    }
+    return ots;
+}
+
+std::vector<OneTouchSetting> readOts(std::span<const uint8_t> body)
+{
+    std::vector<OneTouchSetting> result;
+    ByteReader r(body);
+    while (r.remaining() >= 8 && result.size() < 4)
+    {
+        std::string id = r.ascii(4);
+        uint32_t len = r.u32();
+        auto track = r.bytes(std::min<size_t>(len, r.remaining()));
+        if (id == "MTrk")
+            result.push_back(readOtsTrack(track));
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------- assembly
 
 struct PairedNote {
@@ -242,7 +250,7 @@ struct PairedNote {
     uint8_t key, velocity;
 };
 
-std::vector<PairedNote> pairNotes(const std::vector<RawEvent>& events, int64_t trackEnd)
+std::vector<PairedNote> pairNotes(const std::vector<SmfEvent>& events, int64_t trackEnd)
 {
     std::vector<PairedNote> notes;
     std::map<int, std::vector<size_t>> open; // (channel << 7 | key) → indices of sounding notes, FIFO
@@ -250,7 +258,7 @@ std::vector<PairedNote> pairNotes(const std::vector<RawEvent>& events, int64_t t
     for (const auto& e : events)
     {
         uint8_t type = e.status & 0xF0;
-        if (type != 0x80 && type != 0x90)
+        if (e.status == 0xFF || (type != 0x80 && type != 0x90))
             continue;
         int channel = e.status & 0x0F;
         int id = (channel << 7) | e.data1;
@@ -272,14 +280,8 @@ std::vector<PairedNote> pairNotes(const std::vector<RawEvent>& events, int64_t t
     return notes;
 }
 
-bool isControlEvent(const RawEvent& e)
-{
-    uint8_t type = e.status & 0xF0;
-    return e.status < 0xF0 && type != 0x80 && type != 0x90;
-}
-
 Part buildPart(const CtabEntry& entry, int64_t start, int64_t end,
-               const std::vector<PairedNote>& notes, const std::vector<RawEvent>& events)
+               const std::vector<PairedNote>& notes, const std::vector<SmfEvent>& events)
 {
     Part part;
     part.role = PartRole(entry.destChannel - 8);
@@ -295,7 +297,7 @@ Part buildPart(const CtabEntry& entry, int64_t start, int64_t end,
         }
 
     for (const auto& e : events)
-        if (isControlEvent(e) && (e.status & 0x0F) == entry.sourceChannel && e.tick >= start && e.tick < end)
+        if (isChannelControl(e) && (e.status & 0x0F) == entry.sourceChannel && e.tick >= start && e.tick < end)
             part.controls.push_back({e.tick - start, e.status, e.data1, e.data2});
 
     return part;
@@ -308,48 +310,22 @@ Style readYamahaStyle(std::span<const uint8_t> file, std::string name)
     Style style;
     style.name = std::move(name);
 
-    ByteReader r(file);
-    if (r.remaining() < 14 || r.ascii(4) != "MThd")
-        throw StyleError("not a Yamaha style (missing MThd)");
-    uint32_t headerLen = r.u32();
-    r.u16(); // format
-    uint16_t trackCount = r.u16();
-    uint16_t division = r.u16();
-    r.skip(headerLen - 6);
-    if (division == 0 || (division & 0x8000))
-        throw StyleError("unsupported MIDI time division");
+    detail::SmfFile smf = detail::readSmf(file);
+    detail::rescaleToPpq(smf.events, smf.division);
+    const auto& events = smf.events;
 
-    std::vector<RawEvent> events;
     Casm casm;
     bool hasCasm = false;
-    int tracksRead = 0;
-
-    while (r.remaining() >= 8)
+    for (const auto& chunk : smf.extra)
     {
-        std::string id = r.ascii(4);
-        if (!std::all_of(id.begin(), id.end(), [](char c) { return c >= 0x20 && c < 0x7F; }))
-            break; // trailing garbage
-        uint32_t len = r.u32();
-        auto body = r.bytes(std::min<size_t>(len, r.remaining()));
-
-        if (id == "MTrk" && tracksRead < trackCount)
+        if (chunk.id == "CASM")
         {
-            readTrack(ByteReader(body), events);
-            ++tracksRead;
-        }
-        else if (id == "CASM")
-        {
-            casm = readCasm(ByteReader(body), style.warnings);
+            casm = readCasm(ByteReader(chunk.body), style.warnings);
             hasCasm = true;
         }
+        else if (chunk.id == "OTSc")
+            style.ots = readOts(chunk.body);
     }
-    if (tracksRead == 0)
-        throw StyleError("style has no MIDI track");
-
-    // Rescale to the internal resolution and order events of all tracks.
-    for (auto& e : events)
-        e.tick = (e.tick * kPpq + division / 2) / division;
-    std::stable_sort(events.begin(), events.end(), [](const RawEvent& a, const RawEvent& b) { return a.tick < b.tick; });
 
     const int64_t trackEnd = events.empty() ? 0 : events.back().tick;
 
@@ -363,7 +339,7 @@ Style readYamahaStyle(std::span<const uint8_t> file, std::string name)
             markers.push_back({e.tick, e.meta});
         else if (e.data1 == 0x51 && e.meta.size() == 3 && !tempoSet)
         {
-            uint32_t us = (uint8_t(e.meta[0]) << 16) | (uint8_t(e.meta[1]) << 8) | uint8_t(e.meta[2]);
+            uint32_t us = (uint32_t(uint8_t(e.meta[0])) << 16) | (uint32_t(uint8_t(e.meta[1])) << 8) | uint8_t(e.meta[2]);
             if (us > 0)
                 style.tempo = 60'000'000.0 / us;
             tempoSet = true;
@@ -403,8 +379,8 @@ Style readYamahaStyle(std::span<const uint8_t> file, std::string name)
         if (marker == "SInt")
         {
             for (const auto& e : events)
-                if (isControlEvent(e) && e.tick >= start && e.tick < end && (e.status & 0x0F) >= 8)
-                    style.setup[(e.status & 0x0F) - 8].push_back({0, e.status, e.data1, e.data2});
+                if (isChannelControl(e) && e.tick >= start && e.tick < end && (e.status & 0x0F) >= 8)
+                    style.setup[size_t((e.status & 0x0F) - 8)].push_back({0, e.status, e.data1, e.data2});
             continue;
         }
 
@@ -437,7 +413,7 @@ Style readYamahaStyle(std::span<const uint8_t> file, std::string name)
                 variation.parts.push_back(std::move(part));
         }
         section.variations.push_back(std::move(variation));
-        style.sections[int(*id)] = std::move(section);
+        style.sections[size_t(*id)] = std::move(section);
     }
 
     bool anySection = std::any_of(style.sections.begin(), style.sections.end(), [](const auto& s) { return s.has_value(); });

@@ -19,7 +19,7 @@ przez wirtualny port (loopMIDI / Windows MIDI Services).
 | `core/` | biblioteka `arranger_core`: model stylu, parsery, akordy, transpozycja, sekwencer | tylko C++20 STL |
 | `tools/arrtool/` | CLI: `info` (zrzut struktury stylu), `render` (styl + progresja akordów → plik .mid) | core |
 | `tests/` | testy jednostkowe (własny mini-framework, bez zależności) | core |
-| `app/` *(etap 2)* | aplikacja JUCE: MIDI I/O, zegar czasu rzeczywistego, GUI | core, JUCE |
+| `app/` | aplikacja JUCE: MIDI I/O, zegar czasu rzeczywistego, GUI; `arranger_smoke` | core, JUCE 8.0.9 |
 
 `core` nie zna czasu rzeczywistego ani urządzeń — operuje na tickach.
 Dzięki temu cały silnik da się testować offline (render do pliku MIDI).
@@ -70,10 +70,43 @@ Maszyna stanów sekcji (zgodnie z zachowaniem aranżerów):
 z priorytetem dla najniższego dźwięku jako prymy; tryby Fingered, Fingered On Bass,
 Single Finger.
 
+## Partie klawiatury, OTS i pady
+
+- `Style::ots` — do 4 `OneTouchSetting`, każdy z `PartVoice` dla R1, R2, R3, L
+  (wł./wył., bank, program, transpozycja, głośność/panorama/efekty; `-1` = bez zmiany).
+  - Yamaha: chunk `OTSc` = 4× `MTrk`; kanał 1 → R1, 2 → R2, 3 → R3, 4 → L (w stylach z OTS
+    kanał 4 ma to samo brzmienie we wszystkich OTS — typowe dla lewej ręki). Sysex jest pomijany.
+  - Korg Pa50: obiekt STS nieopisany publicznie; rekord brzmienia zawiera `7F 15 6C`, potem
+    MSB(+3), LSB(+4), program(+6), głośność(+7), panorama(+8), transpozycja(+10, ze znakiem).
+    8 rekordów akompaniamentu, potem bloki po 4 (Upper1–3, Lower) na każde STS.
+    Bit 2 drugiego bajtu nagłówka = partia gra (Upper 1 ma go zawsze).
+  - Pady w STS Korga: po `<nr STS> 02 01 00 00 00 DE 00 FE 04 …` 4 rekordy po 10 bajtów
+    (numer padu, FF, głośność, panorama). Numer = pozycja (od 0) na listach Pa50: dźwięki 0–138,
+    potem funkcje (`arranger/KorgPads.h`; zgodność potwierdzona m.in. Equinoxe 5 = Upp1–Low Mute).
+- `PadPlayer` (rdzeń) — fraza z pliku MIDI na osobnym kanale, ta sama oś ticków co styl,
+  pętla, dopasowanie do akordu (Melody/Root Trans względem CM7), perkusja bez transpozycji.
+- Kanały wyjścia: 1–4 partie klawiatury, 5–8 pady, 9–16 style.
+
+## Aplikacja (`app/`)
+
+- `ArrangerController` — jedyny punkt styku z czasem rzeczywistym. Trzyma `StyleEngine`,
+  `ChordRecognizer`, porty MIDI. Zegar: `HighResolutionTimer` co 1 ms przelicza czas
+  (`Time::getMillisecondCounterHiRes`) na tick (`baseTick + Δms · tempo · PPQ / 60000`)
+  i woła `engine.advanceTo()`. Zmiana tempa „przekotwicza” zegar, więc pozycja się nie przesuwa.
+- Wątki: timer (1 ms), wątek wejścia MIDI, wątek GUI. Silnik i stan klawiatury chroni
+  `engineLock_`; wyjście MIDI — osobny `outLock_` (kolejność: engine → out). Każde sterowanie
+  najpierw dociąga silnik do „teraz”, więc zmiany akordu/sekcji działają z dokładnością < 1 ms.
+- Wejście: nuty poniżej splitu → zbiór trzymanych klawiszy → rozpoznanie akordu → `setChord`
+  (akord zostaje po puszczeniu klawiszy); reszta → przelot na kanał prawej ręki.
+- GUI (`MainComponent`, `StyleBrowser`, `SectionPanel`, `MixerPanel`) odpytuje
+  `controller.status()` 30×/s; nie ma wywołań zwrotnych z wątków czasu rzeczywistego do GUI
+  (poza „Ucz split”, przekazywanym przez `MessageManager::callAsync`).
+
 ## Etapy
 
-1. **(teraz)** core + parsery + akordy + transpozycja + sekwencer + `arrtool render`.
-2. Aplikacja JUCE: wybór portów MIDI, split, zegar RT, panel sterowania (Intro/Main/Fill/Ending,
+1. ✅ core + parsery + akordy + transpozycja + sekwencer + `arrtool render`.
+2. ✅ Aplikacja JUCE: wybór portów MIDI, split, zegar RT, panel sterowania (Intro/Main/Fill/Ending,
    Sync Start, tempo, mikser partii), przeglądarka stylów.
-3. Rejestracje, OTS, multipady, playlista.
+3. ✅ Partie R1–R3/L, OTS (Yamaha OTSc, Korg STS), multipady (pliki MIDI).
+3b. Rejestracje, playlista, pady Yamaha (.pad) i Korg.
 4. Edytor stylów.

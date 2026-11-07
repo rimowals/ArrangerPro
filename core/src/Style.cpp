@@ -40,6 +40,12 @@ std::optional<SectionId> sectionFromYamahaMarker(std::string_view marker)
     return std::nullopt;
 }
 
+std::string_view keyboardPartName(KeyboardPart part)
+{
+    static constexpr std::string_view kNames[kKeyboardPartCount] = {"R1", "R2", "R3", "L"};
+    return kNames[int(part)];
+}
+
 std::string_view styleFormatName(StyleFormat f)
 {
     switch (f)

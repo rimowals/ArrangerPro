@@ -8,6 +8,7 @@
 // and optional commands: @A..@D select a main section, !break triggers the break, '-' repeats
 // the previous chord.
 
+#include "arranger/KorgPads.h"
 #include "arranger/SmfWriter.h"
 #include "arranger/StyleEngine.h"
 #include "arranger/StyleLoader.h"
@@ -82,6 +83,29 @@ int cmdInfo(const std::vector<Style>& styles, bool detail)
                                 std::string(rtrName(r.rtr)).c_str(), r.bassOn ? " bassOn" : "",
                                 p.rule.hasRanges ? " (3 ranges)" : "");
                 }
+        }
+        for (size_t o = 0; o < s.ots.size(); ++o)
+        {
+            std::printf("    OTS %zu:", o + 1);
+            for (int p = 0; p < kKeyboardPartCount; ++p)
+            {
+                const PartVoice& v = s.ots[o].parts[size_t(p)];
+                std::printf("  %s=", std::string(keyboardPartName(KeyboardPart(p))).c_str());
+                if (!v.on)
+                    std::printf("off");
+                else if (v.hasVoice)
+                {
+                    std::printf("%d/%d/%d", v.bankMsb, v.bankLsb, v.program);
+                    if (v.transpose)
+                        std::printf("(%+d)", v.transpose);
+                }
+                else
+                    std::printf("on");
+            }
+            for (int p = 0; p < kStylePadCount; ++p)
+                if (const PadRef& pad = s.ots[o].pads[size_t(p)]; pad.id >= 0)
+                    std::printf("  pad%d=#%d %s", p + 1, pad.id, pad.id >= 0 && korgPa50Pad(pad.id) ? std::string(korgPa50Pad(pad.id)->name).c_str() : "");
+            std::printf("\n");
         }
         for (const auto& w : s.warnings)
             std::printf("    warning: %s\n", w.c_str());
@@ -159,6 +183,7 @@ int cmdRender(std::vector<Style> styles, const std::map<std::string, std::string
     const auto bars = parseSong(opts.at("--song"));
     std::vector<MidiOut> out;
     StyleEngine engine([&](const MidiOut& m) { out.push_back(m); });
+    engine.settings().sendProgramChanges = true; // rendered files are played on GM/XG players
     engine.setStyle(style);
 
     if (opts.contains("--intro"))

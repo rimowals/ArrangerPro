@@ -94,6 +94,20 @@ Bytes buildStyle(bool withCasm)
         Bytes casm;
         chunk(casm, "CSEG", cseg);
         chunk(file, "CASM", casm);
+
+        // Two One Touch Settings: R1 voice + volume, Left voice; then R2 only.
+        Bytes ots1, ots2, otsc;
+        ev(ots1, 0, {0xB0, 0, 0});
+        ev(ots1, 0, {0xB0, 32, 0});
+        ev(ots1, 0, {0xC0, 5});
+        ev(ots1, 0, {0xB0, 7, 100});
+        ev(ots1, 0, {0xC3, 33});
+        ev(ots1, 0, {0xFF, 0x2F, 0x00});
+        ev(ots2, 0, {0xC1, 48});
+        ev(ots2, 0, {0xFF, 0x2F, 0x00});
+        chunk(otsc, "MTrk", ots1);
+        chunk(otsc, "MTrk", ots2);
+        chunk(file, "OTSc", otsc);
     }
     return file;
 }
@@ -128,6 +142,24 @@ TEST_CASE("yamaha SFF2 with CASM")
     CHECK(parts[1].rule.mid.rtr == Rtr::PitchShift);
     CHECK_EQ(int(parts[1].rule.mid.highKey), 6);
     CHECK_EQ(parts[1].notes[0].length, 1920);
+}
+
+TEST_CASE("yamaha one touch settings")
+{
+    Style s = readYamahaStyle(buildStyle(true), "test");
+    CHECK_EQ(s.ots.size(), size_t(2));
+    if (s.ots.size() != 2)
+        return;
+    const auto& r1 = s.ots[0].parts[int(KeyboardPart::Right1)];
+    CHECK(r1.on && r1.hasVoice);
+    CHECK_EQ(int(r1.program), 5);
+    CHECK_EQ(r1.volume, 100);
+    const auto& left = s.ots[0].parts[int(KeyboardPart::Left)];
+    CHECK(left.on);
+    CHECK_EQ(int(left.program), 33);
+    CHECK(!s.ots[0].parts[int(KeyboardPart::Right2)].on);
+    CHECK(s.ots[1].parts[int(KeyboardPart::Right2)].on);
+    CHECK(!s.ots[1].parts[int(KeyboardPart::Right1)].on);
 }
 
 TEST_CASE("yamaha style without CASM uses default rules")

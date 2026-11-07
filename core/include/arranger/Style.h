@@ -141,6 +141,36 @@ struct Section {
     }
 };
 
+// ---- keyboard parts and One Touch Settings ----
+
+// The parts played live from the keyboard: three right-hand layers and the left hand.
+enum class KeyboardPart : uint8_t { Right1, Right2, Right3, Left };
+inline constexpr int kKeyboardPartCount = 4;
+std::string_view keyboardPartName(KeyboardPart part);
+
+struct PartVoice {
+    bool on = false;
+    bool hasVoice = false;   // false: keep whatever voice the part has now
+    uint8_t bankMsb = 0, bankLsb = 0, program = 0;
+    int transpose = 0;       // semitones
+    int volume = -1, pan = -1, reverb = -1, chorus = -1; // -1 = leave unchanged
+};
+
+// One Touch Setting (Yamaha OTS / Korg STS): a registration of the keyboard parts for a style.
+// A multipad the style assigns by number from the keyboard's own pad library (Korg STS).
+// The pad's notes are not part of the style.
+struct PadRef {
+    int id = -1;              // -1: no pad assigned
+    int volume = -1, pan = -1; // -1: unchanged
+};
+
+inline constexpr int kStylePadCount = 4;
+
+struct OneTouchSetting {
+    std::array<PartVoice, kKeyboardPartCount> parts;
+    std::array<PadRef, kStylePadCount> pads{};
+};
+
 enum class StyleFormat : uint8_t { YamahaSff1, YamahaSff2, KorgPa };
 std::string_view styleFormatName(StyleFormat f);
 
@@ -154,6 +184,7 @@ struct Style {
     // Initial channel messages (bank/program/volume/pan/effects) per part, from the style's setup area.
     std::array<std::vector<ChannelEvent>, kPartCount> setup;
     std::array<std::optional<Section>, kSectionCount> sections;
+    std::vector<OneTouchSetting> ots; // usually 4, empty when the style has none
 
     std::vector<std::string> warnings;
 
